@@ -1,147 +1,117 @@
-# card_predictor_p1.py
-# Partie 1 / 2 : CardPredictor – logique complète (prédiction + vérification)
-import re
-import json
-import time
-import logging
+# prediction_p1.py
+import json, re, time, logging
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Any, Set
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 HIGH_VALUE_CARDS = ["A", "K", "Q", "J"]
 
+# ---------- JSON ----------
+def jload(file: str, is_set=False, scalar=False):
+    try:
+        with open(file) as f:
+            data = json.load(f)
+            if is_set: return set(data)
+            if scalar: return (data.get("active", False) if file == "inter_mode_status.json" else float(data))
+            if file == "sequential_history.json": return {int(k): v for k, v in data.items()}
+            return data
+    except (FileNotFoundError, ValueError):
+        if is_set: return set()
+        if scalar: return (False if file == "inter_mode_status.json" else 0.0)
+        return [] if "inter_data" in file else ({})
+    except Exception as e:
+        logger.error("jload %s : %s", file, e)
+        return set() if is_set else (False if file == "inter_mode_status.json" else ([] if "inter_data" in file else {}))
 
-class CardPredictor:
-    """Prédiction & vérification Q – finalisé & sécurisé."""
+def jsave(data, file: str):
+    out = list(data) if isinstance(data, set) else data
+    with open(file, "w") as f: json.dump(out, f, indent=2)
 
+# ---------- CARTES ----------
+def extract_game_number(msg: str) -> Optional[int]:
+    m = re.search(r'#N(\d+)\.', msg, re.I) or re.search(r'🔵(\d+)🔵', msg)
+    return int(m.group(1)) if m else None
+
+def extract_total_points(msg: str) -> Optional[int]:
+    m = re.search(r'#T(\d+)', msg)
+    return int(m.group(1)) if m else None
+
+def extract_first_parentheses(msg: str) -> Optional[str]:
+    m = re.search(r'\(([^)]*)\)', msg)
+    return m.group(1).strip() if m else None
+
+def card_details(content: str) -> List[Tuple[str, str]]:
+    content = content.replace("❤️", "♥️")
+    return re.findall(r'(\d+|[AKQJ])(♠️|♥️|♦️|♣️)', content, re.I)
+
+def first_two_cards(content: str) -> List[str]:
+    return [f"{v}{c}" for v, c in card_details(content)[:2]]
+
+def q_in_first_paren(msg: str) -> bool:
+    content = extract_first_parentheses(msg)
+    if not content: return False
+    return any(v.upper() == "Q" for v, _ in card_details(content))
+
+# ---------- INTER ----------
+class Predictor:
     def __init__(self):
-        # --- Persistance ---
-        self.predictions: Dict[int, Dict]          = self._load("predictions.json")
-        self.processed: Set[int]                   = self._load("processed.json", is_set=True)
-        self.last_pred_time: float                 = self._load("last_prediction_time.json", scalar=True)
-        self.sequential_history: Dict[int, Dict]   = self._load("sequential_history.json")
-        self.inter_data: List[Dict]                = self._load("inter_data.json")
-        self.is_inter_active: bool                 = self._load("inter_mode_status.json", scalar=True)
-        self.smart_rules: List[Dict]               = self._load("smart_rules.json")
+        self.pred     : Dict[int, Dict] = jload("predictions.json")
+        self.proc     : Set[int]        = jload("processed.json", is_set=True)
+        self.last     : float           = jload("last_prediction_time.json", scalar=True)
+        self.seq_hist : Dict[int, Dict] = jload("sequential_history.json")
+        self.inter    : List[Dict]      = jload("inter_data.json")
+        self.active   : bool            = jload("inter_mode_status.json", scalar=True)
+        self.rules    : List[Dict]      = jload("smart_rules.json")
+        self.cooldown = 30
 
-        self.prediction_cooldown = 30
-
-        if self.inter_data and not self.is_inter_active:
-            self.analyze_and_set_smart_rules(initial_load=True)
-
-    # ---------- JSON ----------
-    def _load(self, file: str, is_set=False, scalar=False):
-        try:
-            with open(file, "r") as f:
-                data = json.load(f)
-                if is_set: return set(data)
-                if scalar:
-                    if file == "inter_mode_status.json": return data.get("active", False)
-                    return float(data) if isinstance(data, (int, float)) else 0.0
-                if file == "sequential_history.json":
-                    return {int(k): v for k, v in data.items()}
-                return data
-        except (FileNotFoundError, json.JSONDecodeError):
-            if is_set: return set()
-            if scalar: return (False if file == "inter_mode_status.json" else 0.0)
-            return [] if "inter_data" in file else ({})
-        except Exception as e:
-            logger.error("Load %s : %s", file, e)
-            return set() if is_set else (False if file == "inter_mode_status.json" else ([] if "inter_data" in file else {}))
-
-    def _save(self, data, file: str):
-        out = list(data) if isinstance(data, set) else data
-        try:
-            with open(file, "w") as f:
-                json.dump(out, f, indent=2)
-        except Exception as e:
-            logger.error("Save %s : %s", file, e)
-
+    # ---------- SAVE ----------
     def save_all(self):
-        for attr, fname in [
-            (self.predictions, "predictions.json"),
-            (self.processed, "processed.json"),
-            (self.last_pred_time, "last_prediction_time.json"),
-            (self.sequential_history, "sequential_history.json"),
-            (self.inter_data, "inter_data.json"),
-            (self.is_inter_active, "inter_mode_status.json"),
-            (self.smart_rules, "smart_rules.json"),
-        ]:
-            self._save(attr, fname)
+        for attr, file in [
+            (self.pred, "predictions.json"),
+            (self.proc, "processed.json"),
+            (self.last, "last_prediction_time.json"),
+            (self.seq_hist, "sequential_history.json"),
+            (self.inter, "inter_data.json"),
+            (self.active, "inter_mode_status.json"),
+            (self.rules, "smart_rules.json"),
+        ]: jsave(attr, file)
 
-    # ---------- EXTRACTION ----------
-    def extract_game_number(self, msg: str) -> Optional[int]:
-        m = re.search(r'#N(\d+)\.', msg, re.I) or re.search(r'🔵(\d+)🔵', msg)
-        return int(m.group(1)) if m else None
-
-    def extract_total_points(self, msg: str) -> Optional[int]:
-        m = re.search(r'#T(\d+)', msg)
-        return int(m.group(1)) if m else None
-
-    def extract_first_parentheses_content(self, msg: str) -> Optional[str]:
-        m = re.search(r'\(([^)]*)\)', msg)
-        return m.group(1).strip() if m else None
-
-    def extract_card_details(self, content: str) -> List[Tuple[str, str]]:
-        content = content.replace("❤️", "♥️")
-        return re.findall(r'(\d+|[AKQJ])(♠️|♥️|♦️|♣️)', content, re.I)
-
-    def get_first_two_cards(self, content: str) -> List[str]:
-        details = self.extract_card_details(content)[:2]
-        return [f"{v}{c}" for v, c in details]
-
-    def check_q_in_first_parentheses(self, msg: str) -> Optional[Tuple[str, str]]:
-        content = self.extract_first_parentheses_content(msg)
-        if not content:
-            return None
-        for val, col in self.extract_card_details(content):
-            if val.upper() == "Q":
-                logger.info("Q détectée : Q%s", col)
-                return val, col
-        return None
-
-    # ---------- INTER ----------
-    def collect_inter_data(self, game: int, msg: str):
-        content = self.extract_first_parentheses_content(msg)
-        if not content:
-            return
-        first_two = self.get_first_two_cards(content)
-        if len(first_two) == 2:
-            self.sequential_history[game] = {"cartes": first_two, "date": datetime.now().isoformat()}
-        if self.check_q_in_first_parentheses(msg):
+    # ---------- INTER COLLECT ----------
+    def collect(self, game: int, msg: str):
+        content = extract_first_parentheses(msg)
+        if not content: return
+        f2 = first_two_cards(content)
+        if len(f2) == 2:
+            self.seq_hist[game] = {"cards": f2, "date": datetime.now().isoformat()}
+        if q_in_first_paren(msg):
             n2 = game - 2
-            trigger = self.sequential_history.get(n2)
-            if trigger:
-                if any(e.get("numero_resultat") == game for e in self.inter_data):
-                    logger.warning("Doublon INTER ignoré N=%s", game)
-                    return
-                self.inter_data.append(
-                    {
-                        "numero_resultat": game,
-                        "declencheur": trigger["cartes"],
-                        "numero_declencheur": n2,
-                        "carte_q": "Q",
-                        "date_resultat": datetime.now().isoformat(),
-                    }
-                )
+            trig = self.seq_hist.get(n2)
+            if trig and not any(e.get("numero_resultat") == game for e in self.inter):
+                self.inter.append({
+                    "numero_resultat": game,
+                    "declencheur": trig["cards"],
+                    "numero_declencheur": n2,
+                    "carte_q": "Q",
+                    "date_resultat": datetime.now().isoformat(),
+                })
                 self.save_all()
 
-    def analyze_and_set_smart_rules(self, initial_load=False):
+    # ---------- SMART ----------
+    def analyze(self):
         counts: Dict[tuple, int] = {}
-        for e in self.inter_data:
+        for e in self.inter:
             counts[tuple(e["declencheur"])] = counts.get(tuple(e["declencheur"]), 0) + 1
         top3 = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        self.smart_rules = [{"cards": list(k), "count": v} for k, v in top3]
-        self.is_inter_active = bool(self.smart_rules) or initial_load
+        self.rules = [{"cards": list(k), "count": v} for k, v in top3]
+        self.active = bool(self.rules)
         self.save_all()
 
-    # ---------- CONFIDENCE ----------
+    # ---------- COUNT ----------
     def count_absence_q(self) -> int:
         c = 0
-        for gn in sorted(self.sequential_history.keys(), reverse=True):
-            if not any(crd.startswith("Q") for crd in self.sequential_history[gn]["cartes"]):
+        for gn in sorted(self.seq_hist.keys(), reverse=True):
+            if not any(crd.startswith("Q") for crd in self.seq_hist[gn]["cards"]):
                 c += 1
             else:
                 break
@@ -149,114 +119,90 @@ class CardPredictor:
 
     # ---------- COOLDOWN ----------
     def can_predict(self) -> bool:
-        return time.time() > (self.last_pred_time + self.prediction_cooldown)
+        return time.time() > (self.last + self.cooldown)
 
-    # ---------- INDICATEURS ----------
-    def has_pending_indicators(self, msg: str) -> bool:
+    # ---------- INDICATORS ----------
+    def pending(self, msg: str) -> bool:
         return "🕐" in msg or "⏰" in msg
 
-    def has_completion_indicators(self, msg: str) -> bool:
+    def completed(self, msg: str) -> bool:
         return "✅" in msg or "🔰" in msg
 
-    # ---------- SHOULD_PREDICT ----------
-    def should_predict(self, message: str) -> Tuple[bool, Optional[int], Optional[str]]:
-        if not self.target_channel_id:
+    # ---------- SHOULD ----------
+    def should_predict(self, msg: str) -> Tuple[bool, Optional[int], Optional[str]]:
+        game = extract_game_number(msg)
+        if not game: return False, None, None
+        self.collect(game, msg)
+
+        # 1️⃣ Garde-fou
+        if self.pending(msg) or not self.completed(msg):
+            logger.info("Message non finalisé → aucune règle")
             return False, None, None
 
-        game = self.extract_game_number(message)
-        if not game:
-            return False, None, None
+        g1_content = extract_first_parentheses(msg)
+        if not g1_content: return False, None, None
+        g1_vals = [v.upper() for v, _ in card_details(g1_content)]
+        all_paren = re.findall(r'\(([^)]*)\)', msg)
+        g2_vals = [v.upper() for v, _ in card_details(all_paren[1])] if len(all_paren) > 1 else []
 
-        # Collecte INTER systématique
-        self.collect_inter_data(game, message)
-
-        # 1️⃣ Garde-fou : message non finalisé
-        if self.has_pending_indicators(message):
-            return False, None, None
-        if not self.has_completion_indicators(message):
-            logger.info("❌ PRÉDICTION BLOQUÉE: ✅/🔰 absents OU ⏰ présent")
-            return False, None, None
-
-        # 2️⃣ Extraction groupes
-        g1_content = self.extract_first_parentheses_content(message)
-        if not g1_content:
-            return False, None, None
-
-        g1_cards = self.extract_card_details(g1_content)
-        g1_vals = [v.upper() for v, _ in g1_cards]
-
-        # G2 (second parenthèse)
-        all_paren = re.findall(r'\(([^)]*)\)', message)
-        g2_vals = [v.upper() for v, _ in self.extract_card_details(all_paren[1])] if len(all_paren) > 1 else []
-
-        # 3️⃣ Confiance & prédiction
         confidence = ""
         has_j_only = g1_vals.count("J") == 1 and not any(h in g1_vals for h in ("A", "Q", "K"))
         two_j = g1_vals.count("J") >= 2
-        high_tension = (self.extract_total_points(message) or 0) > 40
-        three_missing = self.count_absence_q() >= 3
+        high_t = (extract_total_points(msg) or 0) > 40
+        three_miss = self.count_absence_q() >= 3
 
         predicted = None
 
-        # Mode INTER prioritaire
-        if self.is_inter_active and self.smart_rules:
-            trigger = self.get_first_two_cards(g1_content)
-            if any(tuple(rule["cards"]) == tuple(trigger) for rule in self.smart_rules):
+        # INTER
+        if self.active and self.rules:
+            trigger = first_two_cards(g1_content)
+            if any(tuple(r["cards"]) == tuple(trigger) for r in self.rules):
                 predicted = "Q"
-                logger.info("🔮 PRÉDICTION INTER: déclencheur %s", trigger)
 
-        # Règles statiques
+        # STATIQUE
         if not predicted:
             if has_j_only:
-                predicted = "Q"
-                confidence = "98%"
+                predicted, confidence = "Q", "98%"
             elif two_j:
-                predicted = "Q"
-                confidence = "57%"
-            elif high_tension:
-                predicted = "Q"
-                confidence = "97%"
-            elif three_missing:
-                predicted = "Q"
-                confidence = "60%"
+                predicted, confidence = "Q", "57%"
+            elif high_t:
+                predicted, confidence = "Q", "97%"
+            elif three_miss:
+                predicted, confidence = "Q", "60%"
             elif {"8", "9", "10"}.issubset(g1_vals) or {"8", "9", "10"}.issubset(g2_vals):
-                predicted = "Q"
-                confidence = "70%"
+                predicted, confidence = "Q", "70%"
             elif "Q" in g1_vals:
-                logger.info("🔮 Q déjà dans G1 → pas de préd")
-                predicted = None
+                logger.info("Q déjà dans G1 → pas de préd")
             else:
-                # K+J, Tag O/R, double G1 faible, etc.
+                # K+J, Tag O/R, double G1 faible
                 if ("K" in g1_vals and "J" in g1_vals) or \
-                   (re.search(r'\b[OR]\b', message)) or \
+                   (re.search(r'\b[OR]\b', msg)) or \
                    (not any(h in g1_vals for h in HIGH_VALUE_CARDS) and
                     not any(h in g2_vals for h in HIGH_VALUE_CARDS) and
-                    self.sequential_history.get(game - 1) and
+                    self.seq_hist.get(game - 1) and
                     not any(h in [re.match(r'(\d+|[AKQJ])', c).group(1)
-                                  for c in self.sequential_history[game - 1]['cartes']]
+                                  for c in self.seq_hist[game - 1]['cartes']]
                             for h in HIGH_VALUE_CARDS)):
-                    predicted = "Q"
-                    confidence = "70%"
+                    predicted, confidence = "Q", "70%"
 
         if predicted and not self.can_predict():
-            logger.warning("⏳ Cooldown actif")
+            logger.warning("Cooldown")
             return False, None, None
 
         if predicted:
-            h = hash(message)
-            if h not in self.processed:
-                self.processed.add(h)
-                self.last_pred_time = time.time()
+            h = hash(msg)
+            if h not in self.proc:
+                self.proc.add(h)
+                self.last = time.time()
                 self.save_all()
                 return True, game, self.make_prediction(game, predicted, confidence)
-
         return False, None, None
 
-    # ---------- MAKE PREDICTION ----------
+    # ---------- MAKE ----------
     def make_prediction(self, game: int, value: str, confidence: str) -> str:
         target = game + 2
         text = f"🔵{target}🔵:Valeur Q statut :⏳" + (f" {confidence}" if confidence else "")
-        self.predictions[target] = {
+        self.pred[target] = {
             "predicted_costume": value,
             "status": "pending",
             "predicted_from": game,
@@ -268,19 +214,17 @@ class CardPredictor:
         self.save_all()
         return text
 
-    # ---------- VERIFICATION ----------
-    def verify_prediction(self, text: str, is_edited: bool = False) -> Optional[Dict]:
-        game = self.extract_game_number(text)
-        if not game or not self.predictions:
-            return None
-
-        for pred_game, pred in self.predictions.items():
+    # ---------- VERIFY ----------
+    def verify(self, msg: str) -> Optional[Dict]:
+        game = extract_game_number(msg)
+        if not game or not self.pred: return None
+        for pred_game, pred in self.pred.items():
             if pred.get("status") != "pending" or pred.get("predicted_costume") != "Q":
                 continue
             offset = game - pred_game
             if 0 <= offset <= 2:
                 symbol_map = {0: "✅0️⃣", 1: "✅1️⃣", 2: "✅2️⃣"}
-                q_found = self.check_q_in_first_parentheses(text)
+                q_found = q_in_first_paren(msg)
                 if q_found:
                     symbol = symbol_map[offset]
                     new_text = f"🔵{pred_game}🔵:Valeur Q statut :{symbol}"
@@ -297,67 +241,62 @@ class CardPredictor:
                     logger.info("Verification ÉCHEC +2 N=%s", game)
                     return {"type": "edit_message", "predicted_game": pred_game, "new_message": new_text}
         return None
-      # card_predictor_p2.py
-# Partie 2 / 2 : handlers Telegram + constantes + mini-main
-import os
-import logging
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from card_predictor_p1 import CardPredictor  # import classe
+        # prediction_p2.py
+import os, logging, requests
+from flask import Flask, request, abort
+from prediction_p1 import Predictor
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- TOKEN ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SOURCE_ID = int(os.getenv("SOURCE_ID") or 0)
+PRED_ID   = int(os.getenv("PRED_ID") or 0)
 
-# ---------- BOT ----------
-predictor = CardPredictor()
+app = Flask(__name__)
+pred = Predictor()
 
+# ---------- TELEGRAM ----------
+def send_text(chat_id: int, text: str) -> int:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    return r.json()["result"]["message_id"]
 
-# ---------- HANDLERS ----------
-async def handle_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post
-    if not msg or msg.chat_id != predictor.target_channel_id:
-        return
-    text = msg.text or msg.caption or ""
-    do_it, game, pred_text = predictor.should_predict(text)
+def edit_text(chat_id: int, msg_id: int, text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    requests.post(url, json={"chat_id": chat_id, "message_id": msg_id, "text": text}, timeout=10)
+
+# ---------- WEBHOOK ----------
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True)
+    if not data: abort(400)
+
+    # message canal SOURCE
+    msg = data.get("channel_post") or data.get("edited_channel_post")
+    if not msg: abort(400)
+    if msg.get("chat", {}).get("id") != SOURCE_ID: abort(400)
+
+    text = msg.get("text") or msg.get("caption") or ""
+    do_it, game, pred_text = pred.should_predict(text)
+
     if do_it and pred_text:
-        sent = await context.bot.send_message(
-            chat_id=predictor.prediction_channel_id, text=pred_text
-        )
-        # on stock l'ID pour edition future
-        predictor.predictions[game + 2]["message_id"] = sent.message_id
-        predictor.save_all()
+        mid = send_text(PRED_ID, pred_text)
+        pred.pred[game + 2]["message_id"] = mid
+        pred.save_all()
 
-
-async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.edited_channel_post
-    if not msg or msg.chat_id != predictor.target_channel_id:
-        return
-    text = msg.text or msg.caption or ""
-    result = predictor.verify_prediction(text, is_edited=True)
+    # vérification (edit)
+    result = pred.verify(text)
     if result and result["type"] == "edit_message":
-        msg_id = predictor.predictions[result["predicted_game"]]["message_id"]
-        if msg_id:
-            await context.bot.edit_message_text(
-                chat_id=predictor.prediction_channel_id,
-                message_id=msg_id,
-                text=result["new_message"],
-            )
+        pg = result["predicted_game"]
+        mid = pred.pred[pg]["message_id"]
+        if mid:
+            edit_text(PRED_ID, mid, result["new_message"])
 
+    return "", 200
 
 # ---------- MAIN ----------
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_message))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edited_message), group=1)
-    logger.info("Bot démarré – prêt à prédire Q")
-    app.run_polling()
-
-
 if __name__ == "__main__":
-    main()
-  
+    # gunicorn entry-point : gunicorn prediction_p2:app
+    logging.info("Webhook ready – /webhook listening")
+                
